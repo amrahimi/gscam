@@ -28,6 +28,7 @@ namespace gscam {
     bool init_stream();
     void publish_stream();
     void cleanup_stream();
+    static GstFlowReturn frame_callback(GstElement *element, gpointer data);
 
     void run();
 

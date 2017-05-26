@@ -192,6 +192,12 @@ namespace gscam {
       }
     }
 
+    g_object_set(G_OBJECT(sink_), "emit-signals", TRUE, NULL);
+
+    // get a callback for every new frame available. the other way requires that we block.
+    g_signal_connect(sink_, "new-sample",
+                     G_CALLBACK(GSCam::frame_callback), this);
+
     // Calibration between ros::Time and gst timestamps
     GstClock * clock = gst_system_clock_obtain();
     ros::Time now = ros::Time::now();
@@ -247,125 +253,150 @@ namespace gscam {
       }
     }
 
+    ros::spinOnce();
+
     if(gst_element_set_state(pipeline_, GST_STATE_PLAYING) == GST_STATE_CHANGE_FAILURE) {
       ROS_ERROR("Could not start stream!");
       return;
     }
     ROS_INFO("Started stream.");
 
-    // Poll the data as fast a spossible
-    while(ros::ok()) {
-      // This should block until a new frame is awake, this way, we'll run at the
-      // actual capture framerate of the device.
-      // ROS_DEBUG("Getting data...");
-      GstSample* sample = gst_app_sink_pull_sample(GST_APP_SINK(sink_));
-      GstClockTime bt = gst_element_get_base_time(pipeline_);
-      GstBuffer* buf = gst_sample_get_buffer(sample);
+    // Wait for EOS or error
+    if (ros::ok())
+    {
+      GstBus *bus = gst_pipeline_get_bus(GST_PIPELINE(pipeline_));
+      GstMessage *msg =
+          gst_bus_timed_pop_filtered(bus, GST_CLOCK_TIME_NONE,
+                                     static_cast<GstMessageType>(GST_MESSAGE_ERROR |
+                                                                 GST_MESSAGE_ERROR));
+      switch (GST_MESSAGE_TYPE(msg))
+      {
 
-      // ROS_INFO("New buffer: timestamp %.6f %lu %lu %.3f",
-      //         GST_TIME_AS_USECONDS(buf->timestamp+bt)/1e6+time_offset_, buf->timestamp, bt, time_offset_);
+        case GST_MESSAGE_EOS:
+          ROS_ERROR("Reached end of stream.");
+          break;
 
+        case GST_MESSAGE_ERROR:
+        {
+          gchar *debug;
+          GError *error;
 
-#if 0
-      GstFormat fmt = GST_FORMAT_TIME;
-      gint64 current = -1;
+          gst_message_parse_error(msg, &error, &debug);
+          g_free(debug);
 
-       Query the current position of the stream
-      if (gst_element_query_position(pipeline_, &fmt, &current)) {
-          ROS_INFO_STREAM("Position "<<current);
+          ROS_ERROR_STREAM("Error: " << error->message);
+          g_error_free(error);
+          ;
+          break;
+        }
+        default:
+          break;
       }
-#endif
-
-      // Stop on end of stream
-      if (!buf) {
-        ROS_INFO("Stream ended.");
-        break;
+      if (msg != NULL)
+      {
+        gst_message_unref(msg);
       }
-
-      // ROS_DEBUG("Got data.");
-
-      // Get the image width and height
-      GstPad* pad = gst_element_get_static_pad(sink_, "sink");
-      const GstCaps *caps = gst_pad_get_current_caps(pad);
-      GstStructure *structure = gst_caps_get_structure(caps,0);
-      gst_structure_get_int(structure,"width",&width_);
-      gst_structure_get_int(structure,"height",&height_);
-
-      // Update header information
-      sensor_msgs::CameraInfoPtr cinfo;
-      cinfo.reset(new sensor_msgs::CameraInfo(camera_info_manager_.getCameraInfo()));
-      if (use_gst_timestamps_) {
-          cinfo->header.stamp = ros::Time(GST_TIME_AS_USECONDS(buf->pts+bt)/1e6+time_offset_);
-      } else {
-          cinfo->header.stamp = ros::Time::now();
-      }
-      // ROS_INFO("Image time stamp: %.3f",cinfo->header.stamp.toSec());
-      cinfo->header.frame_id = frame_id_;
-      if (image_encoding_ == "jpeg") {
-          sensor_msgs::CompressedImagePtr img(new sensor_msgs::CompressedImage());
-          img->header = cinfo->header;
-          img->format = "jpeg";
-          img->data.resize(gst_buffer_get_size(buf));
-
-          GstMapInfo map;
-          gst_buffer_map (buf, &map, GST_MAP_READ);
-          std::copy(map.data, (map.data)+(gst_buffer_get_size(buf)),
-                  img->data.begin());
-          gst_buffer_unmap (buf, &map);
-
-          jpeg_pub_.publish(img);
-          cinfo_pub_.publish(cinfo);
-      } else {
-          // Complain if the returned buffer is smaller than we expect
-          const unsigned int expected_frame_size =
-              image_encoding_ == sensor_msgs::image_encodings::RGB8
-              ? width_ * height_ * 3
-              : width_ * height_;
-
-          if (gst_buffer_get_size(buf) < expected_frame_size) {
-              ROS_WARN_STREAM( "GStreamer image buffer underflow: Expected frame to be "
-                      << expected_frame_size << " bytes but got only "
-                      << (gst_buffer_get_size(buf)) << " bytes. (make sure frames are correctly encoded)");
-          }
-
-          // Construct Image message
-          sensor_msgs::ImagePtr img(new sensor_msgs::Image());
-
-          img->header = cinfo->header;
-
-          // Image data and metadata
-          img->width = width_;
-          img->height = height_;
-          img->encoding = image_encoding_;
-          img->is_bigendian = false;
-          img->data.resize(expected_frame_size);
-
-          // Copy only the data we received
-          // Since we're publishing shared pointers, we need to copy the image so
-          // we can free the buffer allocated by gstreamer
-          if (image_encoding_ == sensor_msgs::image_encodings::RGB8) {
-              img->step = width_ * 3;
-          } else {
-              img->step = width_;
-          }
-
-          GstMapInfo map;
-          gst_buffer_map (buf, &map, GST_MAP_READ);
-          std::copy(
-                  map.data,
-                  (map.data)+(gst_buffer_get_size(buf)),
-                  img->data.begin());
-          gst_buffer_unmap (buf, &map);
-
-          // Publish the image/info
-          camera_pub_.publish(img, cinfo);
-      }
-
-      // Release the buffer
-      gst_buffer_unref(buf);
-
+      gst_object_unref(bus);
       ros::spinOnce();
     }
+  }
+
+  GstFlowReturn GSCam::frame_callback(GstElement *element, gpointer data)
+  {
+    GSCam *pThis = (GSCam *)data;
+
+    GstSample* sample = gst_app_sink_pull_sample(GST_APP_SINK(pThis->sink_));
+    GstClockTime bt = gst_element_get_base_time(pThis->pipeline_);
+    GstBuffer* buf = gst_sample_get_buffer(sample);
+
+    // Stop on end of stream
+    if (!buf) {
+      ROS_INFO("Stream ended.");
+      return GST_FLOW_ERROR;
+    }
+
+    // Get the image width and height
+    GstPad* pad = gst_element_get_static_pad(pThis->sink_, "sink");
+    const GstCaps *caps = gst_pad_get_current_caps(pad);
+    GstStructure *structure = gst_caps_get_structure(caps,0);
+    gst_structure_get_int(structure,"width",&pThis->width_);
+    gst_structure_get_int(structure,"height",&pThis->height_);
+
+    // Update header information
+    sensor_msgs::CameraInfoPtr cinfo;
+    cinfo.reset(new sensor_msgs::CameraInfo(pThis->camera_info_manager_.getCameraInfo()));
+    if (pThis->use_gst_timestamps_) {
+        cinfo->header.stamp = ros::Time(GST_TIME_AS_USECONDS(buf->pts+bt)/1e6+pThis->time_offset_);
+    } else {
+        cinfo->header.stamp = ros::Time::now();
+    }
+    // ROS_INFO("Image time stamp: %.3f",cinfo->header.stamp.toSec());
+    cinfo->header.frame_id = pThis->frame_id_;
+    if (pThis->image_encoding_ == "jpeg") {
+        sensor_msgs::CompressedImagePtr img(new sensor_msgs::CompressedImage());
+        img->header = cinfo->header;
+        img->format = "jpeg";
+        img->data.resize(gst_buffer_get_size(buf));
+
+        GstMapInfo map;
+        gst_buffer_map (buf, &map, GST_MAP_READ);
+        std::copy(map.data, (map.data)+(gst_buffer_get_size(buf)),
+                img->data.begin());
+        gst_buffer_unmap (buf, &map);
+
+        pThis->jpeg_pub_.publish(img);
+        pThis->cinfo_pub_.publish(cinfo);
+    } else {
+        // Complain if the returned buffer is smaller than we expect
+        const unsigned int expected_frame_size =
+            pThis->image_encoding_ == sensor_msgs::image_encodings::RGB8
+            ? pThis->width_ * pThis->height_ * 3
+            : pThis->width_ * pThis->height_;
+
+        if (gst_buffer_get_size(buf) < expected_frame_size) {
+            ROS_WARN_STREAM( "GStreamer image buffer underflow: Expected frame to be "
+                    << expected_frame_size << " bytes but got only "
+                    << (gst_buffer_get_size(buf)) << " bytes. (make sure frames are correctly encoded)");
+        }
+
+        // Construct Image message
+        sensor_msgs::ImagePtr img(new sensor_msgs::Image());
+
+        img->header = cinfo->header;
+
+        // Image data and metadata
+        img->width = pThis->width_;
+        img->height = pThis->height_;
+        img->encoding = pThis->image_encoding_;
+        img->is_bigendian = false;
+        img->data.resize(expected_frame_size);
+
+        // Copy only the data we received
+        // Since we're publishing shared pointers, we need to copy the image so
+        // we can free the buffer allocated by gstreamer
+        if (pThis->image_encoding_ == sensor_msgs::image_encodings::RGB8) {
+            img->step = pThis->width_ * 3;
+        } else {
+            img->step = pThis->width_;
+        }
+
+        GstMapInfo map;
+        gst_buffer_map (buf, &map, GST_MAP_READ);
+        std::copy(
+                map.data,
+                (map.data)+(gst_buffer_get_size(buf)),
+                img->data.begin());
+        gst_buffer_unmap (buf, &map);
+
+        // Publish the image/info
+        pThis->camera_pub_.publish(img, cinfo);
+    }
+
+    // Release the buffer
+    gst_buffer_unref(buf);
+
+    ros::spinOnce();
+    return GST_FLOW_OK;
   }
 
   void GSCam::cleanup_stream()
